@@ -276,6 +276,8 @@ const AddPlatformModal = ModalHOC<{
       debounceMs: 1000,
       autoDetect: true,
       timeout: 10000,
+      testAllKeys: api_key && api_key.split(/[,
+]/).filter((k: string) => k.trim()).length > 1,
     }
   );
 

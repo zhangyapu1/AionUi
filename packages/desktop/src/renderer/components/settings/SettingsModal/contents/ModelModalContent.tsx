@@ -6,6 +6,7 @@
 
 import { ipcBridge } from '@/common';
 import type { IProvider } from '@/common/config/storage';
+import { storeKeys, parseKeys, isAuthError, rotateProviderKey, getKeyCount, getAllKeys } from '@/common/api/KeyRotator';
 import { Button, Divider, Message, Popconfirm, Collapse, Tag, Switch, Tooltip } from '@arco-design/web-react';
 import { DeleteFour, Info, Minus, Plus, Write, Heartbeat } from '@icon-park/react';
 import React, { useEffect, useState } from 'react';
@@ -55,7 +56,11 @@ const getNextProtocol = (current: string): string => {
 };
 
 // Calculate API Key count
-const getApiKeyCount = (api_key: string): number => {
+const getApiKeyCount = (providerId: string, api_key: string): number => {
+  // Check localStorage first (for providers with multiple keys)
+  const storedCount = getKeyCount(providerId);
+  if (storedCount > 0) return storedCount;
+  // Fallback to parsing the api_key string
   if (!api_key) return 0;
   return api_key.split(/[,\n]/).filter((k) => k.trim().length > 0).length;
 };
@@ -106,12 +111,25 @@ const ModelModalContent: React.FC = () => {
    * The caller is expected to have mutated the id-bearing record already.
    */
   const persistPlatform = async (platform: IProvider): Promise<void> => {
-    const existing = (data || []).some((item) => item.id === platform.id);
+    // Parse and store all keys for rotation, but only send the first key to backend
+    const rawKey = (platform.api_key || '').replace(/[\r\n\t]/g, '').trim();
+    const allKeys = parseKeys(rawKey);
+    const firstKey = allKeys.length > 0 ? allKeys[0] : '';
+
+    // Always update localStorage with the full key list
+    // (storeKeys handles both single and multiple keys)
+    storeKeys(platform.id, rawKey);
+
+    const cleanedPlatform = {
+      ...platform,
+      api_key: firstKey,
+    };
+    const existing = (data || []).some((item) => item.id === cleanedPlatform.id);
     if (existing) {
-      const { id, ...body } = platform;
+      const { id, ...body } = cleanedPlatform;
       await ipcBridge.mode.updateProvider.invoke({ id, ...body });
     } else {
-      await ipcBridge.mode.createProvider.invoke(platform);
+      await ipcBridge.mode.createProvider.invoke(cleanedPlatform);
     }
   };
 
@@ -188,82 +206,138 @@ const ModelModalContent: React.FC = () => {
     updatePlatform(updated, () => {});
   };
 
-  // Execute provider/model health check without creating a conversation.
+  // Execute provider/model health check — tests each key individually
   const performHealthCheck = async (platform: IProvider, modelName: string) => {
     const loadingKey = `${platform.id}-${modelName}`;
     setHealthCheckLoading((prev) => ({ ...prev, [loadingKey]: true }));
 
-    const startTime = Date.now();
+    const allKeys = getAllKeys(platform.id);
+    const keysToTest = allKeys.length > 0 ? allKeys : [platform.api_key];
+    const results: { keyIndex: number; keyPreview: string; healthy: boolean; latency: number; error?: string }[] = [];
 
-    try {
-      const result = await ipcBridge.acpConversation.checkProviderHealth.invoke({
-        provider_id: platform.id,
-        model: modelName,
-      });
-      const latency = result.elapsed_ms || Date.now() - startTime;
-      const success = result.status === 'healthy';
-      const errorMessage = result.message || t('common.unknownError');
+    for (let i = 0; i < keysToTest.length; i++) {
+      const key = keysToTest[i];
+      const keyPreview = key.length > 8 ? `${key.slice(0, 4)}...${key.slice(-4)}` : '***';
 
-      try {
-        // 先获取最新的数据，确保不会覆盖其他并发的更新
-        const latestData = await ipcBridge.mode.listProviders.invoke();
-        const latestPlatform = (latestData || []).find((item) => item.id === platform.id);
-        const model_health = { ...latestPlatform?.model_health };
-        model_health[modelName] = {
-          status: success ? 'healthy' : 'unhealthy',
-          last_check: Date.now(),
-          latency,
-          error: success ? undefined : errorMessage,
-        };
-
-        await ipcBridge.mode.updateProvider.invoke({ id: platform.id, model_health });
-        await mutate();
-        if (success) {
-          Message.success({
-            content: `${platform.name} - ${modelName}: ${t('common.success')} (${latency}ms)`,
-            duration: 3000,
-          });
-        } else {
-          Message.error({
-            content: `${platform.name} - ${modelName}: ${t('common.failed')} - ${errorMessage}`,
-            duration: 5000,
-          });
+      // Update backend with this key
+      if (keysToTest.length > 1) {
+        try {
+          await ipcBridge.mode.updateProvider.invoke({ id: platform.id, api_key: key });
+        } catch {
+          results.push({ keyIndex: i, keyPreview, healthy: false, latency: 0, error: 'Failed to update key' });
+          continue;
         }
-      } catch (saveError) {
-        console.error('Failed to save health check result:', saveError);
-        Message.error({
-          content: t('settings.saveModelConfigFailed'),
-          duration: 3000,
+      }
+
+      const startTime = Date.now();
+      try {
+        const result = await ipcBridge.acpConversation.checkProviderHealth.invoke({
+          provider_id: platform.id,
+          model: modelName,
+        });
+        const latency = result.elapsed_ms || Date.now() - startTime;
+        const healthy = result.status === 'healthy';
+        results.push({
+          keyIndex: i,
+          keyPreview,
+          healthy,
+          latency,
+          error: healthy ? undefined : (result.message || t('common.unknownError')),
+        });
+      } catch (error: unknown) {
+        results.push({
+          keyIndex: i,
+          keyPreview,
+          healthy: false,
+          latency: Date.now() - startTime,
+          error: error instanceof Error ? error.message : String(error),
         });
       }
-    } catch (error: unknown) {
-      const latency = Date.now() - startTime;
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      Message.error({
-        content: `${platform.name} - ${modelName}: ${t('common.failed')} - ${errorMessage}`,
-        duration: 5000,
+    }
+
+    // Restore first key to backend
+    if (keysToTest.length > 1) {
+      try {
+        await ipcBridge.mode.updateProvider.invoke({ id: platform.id, api_key: keysToTest[0] });
+      } catch {
+        // ignore
+      }
+    }
+
+    // Save health result for the model (use first key's result as primary)
+    const primaryResult = results[0];
+    try {
+      const latestData = await ipcBridge.mode.listProviders.invoke();
+      const latestPlatform = (latestData || []).find((item) => item.id === platform.id);
+      const model_health = { ...latestPlatform?.model_health };
+      model_health[modelName] = {
+        status: primaryResult?.healthy ? 'healthy' : 'unhealthy',
+        last_check: Date.now(),
+        latency: primaryResult?.latency ?? 0,
+        error: primaryResult?.healthy ? undefined : (primaryResult?.error || t('common.unknownError')),
+      };
+      await ipcBridge.mode.updateProvider.invoke({ id: platform.id, model_health });
+      await mutate();
+    } catch (saveError) {
+      console.error('Failed to save health check result:', saveError);
+    }
+
+    // Show summary
+    const healthyCount = results.filter((r) => r.healthy).length;
+    const unhealthyCount = results.filter((r) => !r.healthy).length;
+
+    if (keysToTest.length === 1) {
+      // Single key — simple message
+      if (primaryResult?.healthy) {
+        Message.success({
+          content: `${platform.name} - ${modelName}: ${t('common.success')} (${primaryResult.latency}ms)`,
+          duration: 3000,
+        });
+      } else {
+        Message.error({
+          content: `${platform.name} - ${modelName}: ${t('common.failed')} - ${primaryResult?.error}`,
+          duration: 5000,
+        });
+      }
+    } else {
+      // Multiple keys — show summary
+      if (unhealthyCount === 0) {
+        Message.success({
+          content: `${platform.name} - ${modelName}: All ${keysToTest.length} keys healthy`,
+          duration: 3000,
+        });
+      } else if (healthyCount === 0) {
+        Message.error({
+          content: `${platform.name} - ${modelName}: All ${keysToTest.length} keys failed`,
+          duration: 5000,
+        });
+      } else {
+        Message.warning({
+          content: `${platform.name} - ${modelName}: ${healthyCount}/${keysToTest.length} keys healthy, ${unhealthyCount} failed`,
+          duration: 5000,
+        });
+      }
+
+      // Log detailed results for debugging
+      console.log(`[KeyRotator] Health check results for ${platform.name} - ${modelName}:`);
+      results.forEach((r) => {
+        const status = r.healthy ? 'OK' : 'FAIL';
+        console.log(`  Key ${r.keyIndex + 1} (${r.keyPreview}): ${status} ${r.latency}ms ${r.error || ''}`);
       });
 
-      try {
-        // 先获取最新的数据，确保不会覆盖其他并发的更新
-        const latestData = await ipcBridge.mode.listProviders.invoke();
-        const latestPlatform = (latestData || []).find((item) => item.id === platform.id);
-        const model_health = { ...latestPlatform?.model_health };
-        model_health[modelName] = {
-          status: 'unhealthy',
-          last_check: Date.now(),
-          latency,
-          error: errorMessage,
-        };
-
-        await ipcBridge.mode.updateProvider.invoke({ id: platform.id, model_health });
-        await mutate();
-      } catch (saveError) {
-        console.error('Failed to save health check result:', saveError);
+      // Show individual failures as warnings
+      const failedKeys = results.filter((r) => !r.healthy);
+      if (failedKeys.length > 0 && failedKeys.length < keysToTest.length) {
+        failedKeys.forEach((r) => {
+          Message.warning({
+            content: `Key ${r.keyIndex + 1} (${r.keyPreview}): ${r.error}`,
+            duration: 4000,
+          });
+        });
       }
-    } finally {
-      setHealthCheckLoading((prev) => ({ ...prev, [loadingKey]: false }));
     }
+
+    setHealthCheckLoading((prev) => ({ ...prev, [loadingKey]: false }));
   };
 
   const clearAllHealthData = () => {
@@ -438,11 +512,11 @@ const ModelModalContent: React.FC = () => {
                               className='cursor-pointer hover:text-t-primary transition-colors'
                               onClick={() => editModalCtrl.open({ data: platform })}
                             >
-                              {t('settings.apiKeyCount')}（{getApiKeyCount(platform.api_key)}）
+                              {t('settings.apiKeyCount')}（{getApiKeyCount(platform.id, platform.api_key)}）
                             </span>
                           </span>
                           <span className='text-12px text-t-secondary whitespace-nowrap md:hidden'>
-                            {(platform.models ?? []).length} / {getApiKeyCount(platform.api_key)}
+                            {(platform.models ?? []).length} / {getApiKeyCount(platform.id, platform.api_key)}
                           </span>
                           {/* 供应商启用开关 / Provider enable switch */}
                           <Switch

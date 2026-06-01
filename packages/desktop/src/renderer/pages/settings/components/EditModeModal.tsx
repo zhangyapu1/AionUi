@@ -8,6 +8,7 @@ import { LinkCloud } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import useModeModeList from '@renderer/hooks/agent/useModeModeList';
 import { getProviderLogo } from '@/renderer/utils/model/modelPlatforms';
+import { getCurrentKey, getKeyCount } from '@/common/api/KeyRotator';
 
 /**
  * 供应商 Logo 组件
@@ -41,18 +42,40 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
     // For Bedrock, don't pass bedrock_config to avoid auto-refresh on input changes
     // We'll build it dynamically in onFocus
     // When is_full_url, pass empty base_url to prevent auto-fetch with the full endpoint URL
+    // Use the first key from localStorage if available
+    const storedApiKey = data?.id ? getCurrentKey(data.id) : null;
+    const effectiveApiKey = storedApiKey || data?.api_key || '';
     const modelListState = useModeModeList(
       data?.platform || 'gemini',
       isFullUrl ? '' : data?.base_url,
-      isFullUrl ? '' : data?.api_key,
+      isFullUrl ? '' : effectiveApiKey,
       true,
       undefined
     );
 
     useEffect(() => {
       if (data) {
+        // Load full key list from localStorage if available
+        const storedCount = getKeyCount(data.id);
+        let apiKeyDisplay = data.api_key || '';
+        if (storedCount > 1) {
+          // Reconstruct the full key list from localStorage for display
+          try {
+            const raw = localStorage.getItem(`aionui_keys_${data.id}`);
+            if (raw) {
+              const state = JSON.parse(raw);
+              if (state.keys && state.keys.length > 0) {
+                apiKeyDisplay = state.keys.join(',');
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+
         form.setFieldsValue({
           ...data,
+          api_key: apiKeyDisplay,
           model:
             data.models && data.models.length > 0
               ? data.models.length === 1

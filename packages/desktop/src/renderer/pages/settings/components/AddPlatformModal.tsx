@@ -2,6 +2,7 @@ import type { IProvider } from '@/common/config/storage';
 import type { ProtocolDetectionResponse, ProtocolType } from '@/common/utils/protocolDetector';
 import { ipcBridge } from '@/common';
 import { uuid } from '@/common/utils';
+import { storeKeys, parseKeys } from '@/common/api/KeyRotator';
 import { isGoogleApisHost } from '@/common/utils/urlValidation';
 import ModalHOC from '@/renderer/utils/ui/ModalHOC';
 import { Form, Input, Message, Select, Switch } from '@arco-design/web-react';
@@ -344,14 +345,22 @@ const AddPlatformModal = ModalHOC<{
         const name = selectedPlatform?.i18nKey
           ? t(selectedPlatform.i18nKey)
           : (selectedPlatform?.name ?? values.platform);
+        const rawKey = isBedrock ? '' : (values.api_key || '').replace(/[\r\n\t]/g, '').trim();
+        const allKeys = parseKeys(rawKey);
+        const firstKey = allKeys.length > 0 ? allKeys[0] : '';
+
+        const providerId = uuid();
+        // Always store full key list in localStorage
+        storeKeys(providerId, rawKey);
+
         const provider: IProvider = {
-          id: uuid(),
+          id: providerId,
           platform: selectedPlatform?.platform ?? 'custom',
           name,
           // 优先使用用户输入的 base_url，否则使用平台预设值
           // Prefer user input base_url, fallback to platform preset
           base_url: isBedrock ? '' : values.base_url || selectedPlatform?.base_url || '',
-          api_key: isBedrock ? '' : values.api_key,
+          api_key: firstKey,
           models: [values.model],
           is_full_url: isFullUrl,
         };

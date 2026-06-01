@@ -6,6 +6,7 @@
 
 import { ipcBridge } from '@/common';
 import type { IConversationMcpStatus } from '@/common/config/storage';
+import { isAuthError, rotateProviderKey, getKeyCount } from '@/common/api/KeyRotator';
 import AgentModeSelector from '@/renderer/components/agent/AgentModeSelector';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import MobileActionSheet, {
@@ -222,46 +223,61 @@ const AionrsSendBox: React.FC<{
 
       const displayMessage = buildDisplayMessage(input, files, workspacePath);
       let msg_id: string | null = null;
-      try {
-        void checkAndUpdateTitle(conversation_id, input);
-        // Wait for the server-assigned msg_id before rendering the optimistic
-        // user bubble so the local row uses the same id as the DB row and
-        // subsequent WebSocket stream events — avoids duplicate bubbles when
-        // useMessageLstCache reloads.
-        const res = await ipcBridge.conversation.sendMessage.invoke({
-          input: displayMessage,
-          conversation_id,
-          files,
-        });
-        msg_id = res.msg_id;
-        setActiveMsgId(msg_id);
-        // Use add=false (compose mode) so composeMessageWithIndex can de-dup
-        // by msg_id — this prevents a duplicate bubble if useMessageLstCache
-        // already inserted the DB row for this same msg_id.
-        addOrUpdateMessage({
-          id: msg_id,
-          msg_id,
-          type: 'text',
-          position: 'right',
-          conversation_id,
-          content: {
-            content: displayMessage,
-          },
-          created_at: Date.now(),
-        });
-        emitter.emit('chat.history.refresh');
-        if (files.length > 0) {
-          emitter.emit('aionrs.workspace.refresh');
+
+      // Get provider id for key rotation
+      const providerId = current_model?.id;
+      const maxRetries = providerId ? getKeyCount(providerId) : 1;
+
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          void checkAndUpdateTitle(conversation_id, input);
+          const res = await ipcBridge.conversation.sendMessage.invoke({
+            input: displayMessage,
+            conversation_id,
+            files,
+          });
+          msg_id = res.msg_id;
+          setActiveMsgId(msg_id);
+          addOrUpdateMessage({
+            id: msg_id,
+            msg_id,
+            type: 'text',
+            position: 'right',
+            conversation_id,
+            content: {
+              content: displayMessage,
+            },
+            created_at: Date.now(),
+          });
+          emitter.emit('chat.history.refresh');
+          if (files.length > 0) {
+            emitter.emit('aionrs.workspace.refresh');
+          }
+          break; // Success — exit retry loop
+        } catch (error) {
+          // If auth error and we have more keys to try, rotate and retry
+          if (isAuthError(error) && providerId && attempt < maxRetries - 1) {
+            const newKey = await rotateProviderKey(providerId, async (id, fields) => {
+              await ipcBridge.mode.updateProvider.invoke({ id, ...fields });
+            });
+            if (newKey) {
+              console.log(`[KeyRotator] Rotated to key ${attempt + 2}/${maxRetries}, retrying...`);
+              if (msg_id) removeMessageByMsgId(msg_id);
+              msg_id = null;
+              continue; // Retry with next key
+            }
+          }
+          // No more keys to try or non-auth error
+          if (msg_id) removeMessageByMsgId(msg_id);
+          throw error;
         }
-      } catch (error) {
-        if (msg_id) removeMessageByMsgId(msg_id);
-        throw error;
       }
     },
     [
       addOrUpdateMessage,
       checkAndUpdateTitle,
       conversation_id,
+      current_model?.id,
       current_model?.use_model,
       setActiveMsgId,
       removeMessageByMsgId,

@@ -270,7 +270,7 @@ const AddPlatformModal = ModalHOC<{
   const inputChangedSinceLastSwitch =
     !lastDetectionInput || lastDetectionInput.base_url !== actualBaseUrl || lastDetectionInput.api_key !== api_key;
   // Check if multiple API keys are configured (comma or newline separated)
-  const hasMultipleKeys = api_key && api_key.split(/[,\n]/).filter((k) => k.trim()).length > 1;
+  const hasMultipleKeys = api_key && api_key.split(/[,\n]/).filter((k: string) => k.trim()).length > 1;
 
   const protocolDetection = useProtocolDetection(
     shouldEnableDetection && inputChangedSinceLastSwitch ? actualBaseUrl : '',

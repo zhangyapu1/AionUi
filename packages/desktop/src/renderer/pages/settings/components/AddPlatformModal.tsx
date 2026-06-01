@@ -269,6 +269,9 @@ const AddPlatformModal = ModalHOC<{
   // Only trigger detection when input changed since last accepted suggestion
   const inputChangedSinceLastSwitch =
     !lastDetectionInput || lastDetectionInput.base_url !== actualBaseUrl || lastDetectionInput.api_key !== api_key;
+  // Check if multiple API keys are configured (comma or newline separated)
+  const hasMultipleKeys = api_key && api_key.split(/[,\n]/).filter((k) => k.trim()).length > 1;
+
   const protocolDetection = useProtocolDetection(
     shouldEnableDetection && inputChangedSinceLastSwitch ? actualBaseUrl : '',
     shouldEnableDetection && inputChangedSinceLastSwitch ? api_key : '',
@@ -276,6 +279,7 @@ const AddPlatformModal = ModalHOC<{
       debounceMs: 1000,
       autoDetect: true,
       timeout: 10000,
+      testAllKeys: hasMultipleKeys,
     }
   );
 
